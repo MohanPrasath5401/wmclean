@@ -1,0 +1,74 @@
+name: remove-watermark
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Direct, seekable HTTPS URL of the video (R2/S3 presigned GET, etc). NOT a Google Drive share page."
+        required: true
+      upload_url:
+        description: "Presigned HTTPS PUT URL for the result (optional; otherwise download the Actions artifact)"
+        required: false
+      chunks:
+        description: "Parallel chunks (free plan: max 20 run at once)"
+        default: "20"
+      roi:
+        description: "Optional x,y,w,h to force the watermark region"
+        required: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt && sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Detect mask
+        run: |
+          python -m wmclean detect "${{ inputs.video_url }}" --mask mask.png --preview preview.png ${{ inputs.roi && format('--roi {0}', inputs.roi) || '' }}
+      - id: plan
+        run: echo "matrix=$(python -m wmclean plan '${{ inputs.video_url }}' --chunks ${{ inputs.chunks }})" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with: { name: mask, path: "mask.png\npreview.png" }
+
+  chunk:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        part: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt && sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/download-artifact@v4
+        with: { name: mask }
+      - run: >
+          python -m wmclean chunk "${{ inputs.video_url }}" --mask mask.png
+          --start ${{ matrix.part.start }} --dur ${{ matrix.part.dur }}
+          --out part_${{ matrix.part.i }}.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.part.i }}
+          path: part_${{ matrix.part.i }}.mp4
+          compression-level: 0
+
+  merge:
+    needs: chunk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/download-artifact@v4
+        with: { pattern: "part-*", merge-multiple: true }
+      - run: |
+          python3 -m pip install -q opencv-python-headless numpy
+          python3 -m wmclean merge --out clean.mp4 $(ls part_*.mp4 | sort -V)
+      - if: ${{ inputs.upload_url != '' }}
+        run: curl -sS --fail -T clean.mp4 "${{ inputs.upload_url }}"
+      - uses: actions/upload-artifact@v4
+        with: { name: clean-video, path: clean.mp4, compression-level: 0, retention-days: 1 }
